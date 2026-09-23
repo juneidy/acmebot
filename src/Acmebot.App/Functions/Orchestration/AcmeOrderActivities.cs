@@ -282,17 +282,15 @@ public partial class AcmeOrderActivities(
         }
         catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.Conflict)
         {
-            certificateOperation = await certificateClient.GetCertificateOperationAsync(certificateName, cancellationToken);
-
-            if (KeyVaultCsrSigner.HasSamePublicKey(KeyVaultCsrSigner.GetPublicKey(certificateOperation.Properties.Csr), signingPublicKey))
+            // Never reuse the conflicting operation: it can hold another key, or older DNS names and tags, or have finished in the
+            // meantime. The key is reused either way, so starting over costs nothing.
+            if (!await DeletePendingCertificateOperationAsync(certificateClient, certificateName, cancellationToken))
             {
-                return certificateOperation;
+                // The conflict is not caused by a pending operation, for example a soft-deleted certificate
+                throw;
             }
 
-            // A pending operation left by an earlier attempt holds a different key, so the issued certificate could not be merged into it
             LogReplacingPendingCertificateOperation(logger, certificateName);
-
-            await certificateOperation.DeleteAsync(cancellationToken);
 
             certificateOperation = await certificateClient.StartCreateCertificateAsync(certificateName, certificatePolicy, tags: tags, preserveCertificateOrder: true, cancellationToken: cancellationToken);
         }
@@ -305,27 +303,41 @@ public partial class AcmeOrderActivities(
         return certificateOperation;
     }
 
-    private static async Task DeletePendingCertificateOperationAsync(CertificateClient certificateClient, string certificateName, CancellationToken cancellationToken)
+    // Returns false when there is no pending operation
+    private static async Task<bool> DeletePendingCertificateOperationAsync(CertificateClient certificateClient, string certificateName, CancellationToken cancellationToken)
     {
+        CertificateOperation certificateOperation;
+
         try
         {
-            var certificateOperation = await certificateClient.GetCertificateOperationAsync(certificateName, cancellationToken);
-
-            if (!certificateOperation.HasCompleted)
-            {
-                await certificateOperation.DeleteAsync(cancellationToken);
-            }
+            certificateOperation = await certificateClient.GetCertificateOperationAsync(certificateName, cancellationToken);
         }
         catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.NotFound)
         {
-            // No pending operation
+            return false;
         }
+
+        // Only an in-progress pending object blocks a new version (409); Key Vault overwrites completed, failed or cancelled ones on create.
+        // HasCompleted cannot tell them apart here, because only UpdateStatus sets it and a lookup does not call it.
+        if (string.Equals(certificateOperation.Properties.Status, "inProgress", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                await certificateOperation.DeleteAsync(cancellationToken);
+            }
+            catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.NotFound)
+            {
+                // Already removed by a concurrent run
+            }
+        }
+
+        return true;
     }
 
     [LoggerMessage(LogLevel.Information, "No usable Key Vault certificate version to sign the CSR with. Creating a self-signed version to hold a new key. CertificateName: {CertificateName}")]
     private static partial void LogCreatingSelfSignedCertificate(ILogger logger, string certificateName);
 
-    [LoggerMessage(LogLevel.Warning, "Replacing a pending Key Vault certificate operation whose key differs from the current certificate key. CertificateName: {CertificateName}")]
+    [LoggerMessage(LogLevel.Warning, "Replacing a pending Key Vault certificate operation left by an earlier or concurrent attempt. CertificateName: {CertificateName}")]
     private static partial void LogReplacingPendingCertificateOperation(ILogger logger, string certificateName);
 
     [LoggerMessage(LogLevel.Error, "ACME domain validation failed. ProblemDetails: {ProblemDetailsJson}")]

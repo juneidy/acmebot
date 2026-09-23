@@ -235,35 +235,105 @@ public sealed class AcmeOrderActivitiesTests
         Assert.Empty(signers.Signers);
     }
 
-    [Fact]
-    public async Task CreateCsrWithoutBasicConstraintsAsync_WithInProgressPendingOperationForCurrentKey_ReusesIt()
-    {
-        using var key = RSA.Create(2048);
-        var certificateClient = new FakeCertificateClient(TestCertificateName);
-        certificateClient.Current = certificateClient.CreateVersion(key);
-        certificateClient.Pending = FakeCertificateClient.CreatePendingOperation(key, "inProgress");
-        var policyItem = CreatePolicyItem();
-
-        var csr = await CreateCsrWithoutBasicConstraintsAsync(certificateClient, policyItem, new SignerRecorder(certificateClient));
-
-        Assert.Equal(["get-certificate", "create:Unknown", "conflict", "get-pending"], certificateClient.Events);
-        AssertRebuiltCsr(csr, key, policyItem.DnsNames);
-    }
-
-    [Fact]
-    public async Task CreateCsrWithoutBasicConstraintsAsync_WithInProgressPendingOperationForOtherKey_ReplacesIt()
+    [Theory]
+    [InlineData("SameKey")]
+    [InlineData("SameKeyStaleMetadata")]
+    [InlineData("OtherKey")]
+    [InlineData("CancellationRequested")]
+    public async Task CreateCsrWithoutBasicConstraintsAsync_WithInProgressPendingOperation_ReplacesIt(string state)
     {
         using var key = RSA.Create(2048);
         using var otherKey = RSA.Create(2048);
         var certificateClient = new FakeCertificateClient(TestCertificateName);
         certificateClient.Current = certificateClient.CreateVersion(key);
-        certificateClient.Pending = FakeCertificateClient.CreatePendingOperation(otherKey, "inProgress");
+        var policyItem = CreatePolicyItem();
+        var staleTags = new Dictionary<string, string> { ["Acmebot"] = "{\"endpoint\":\"old.example.com\"}" };
+
+        certificateClient.Pending = state switch
+        {
+            "SameKey" => FakeCertificateClient.CreatePendingOperation(key, "inProgress"),
+            "SameKeyStaleMetadata" => FakeCertificateClient.CreatePendingOperation(key, "inProgress", ["old.example.com"], staleTags),
+            "OtherKey" => FakeCertificateClient.CreatePendingOperation(otherKey, "inProgress"),
+            "CancellationRequested" => FakeCertificateClient.CreatePendingOperation(key, "inProgress", cancellationRequested: true),
+            _ => throw new ArgumentOutOfRangeException(nameof(state))
+        };
+
+        var signers = new SignerRecorder(certificateClient);
+
+        var csr = await CreateCsrWithoutBasicConstraintsAsync(certificateClient, policyItem, signers);
+
+        Assert.Equal(["get-certificate", "create:Unknown", "conflict", "get-pending", "delete:inProgress", "create:Unknown"], certificateClient.Events);
+        Assert.Equal(2, certificateClient.Creates.Count);
+
+        foreach (var create in certificateClient.Creates)
+        {
+            Assert.True(create.ReuseKey);
+            Assert.True(create.PreserveCertificateOrder);
+            Assert.Equal(policyItem.DnsNames, create.DnsNames);
+            AssertTags(policyItem.ToCertificateTags(s_acmeEndpoint), create.Tags);
+        }
+
+        var pending = Assert.IsType<FakePendingOperation>(certificateClient.Pending);
+        AssertTags(policyItem.ToCertificateTags(s_acmeEndpoint), pending.Tags);
+
+        Assert.Equal(certificateClient.Current.KeyId, Assert.Single(signers.KeyIds));
+        Assert.Single(Assert.Single(signers.Signers).Algorithms);
+        AssertRebuiltCsr(csr, key, policyItem.DnsNames);
+    }
+
+    [Theory]
+    [InlineData("completed")]
+    [InlineData("failed")]
+    [InlineData("cancelled")]
+    public async Task CreateCsrWithoutBasicConstraintsAsync_WhenPendingOperationFinishesAfterConflict_RecreatesWithoutDeleting(string status)
+    {
+        using var key = RSA.Create(2048);
+        var certificateClient = new FakeCertificateClient(TestCertificateName);
+        certificateClient.Current = certificateClient.CreateVersion(key);
+        certificateClient.Pending = FakeCertificateClient.CreatePendingOperation(key, "inProgress");
+
+        // A concurrent run finishes the operation between the conflict and the lookup
+        certificateClient.BeforeNextGetPendingOperation = () => certificateClient.Pending = certificateClient.Pending! with { Status = status };
+
         var policyItem = CreatePolicyItem();
 
         var csr = await CreateCsrWithoutBasicConstraintsAsync(certificateClient, policyItem, new SignerRecorder(certificateClient));
 
-        Assert.Equal(["get-certificate", "create:Unknown", "conflict", "get-pending", "delete:inProgress", "create:Unknown"], certificateClient.Events);
+        Assert.Equal(["get-certificate", "create:Unknown", "conflict", "get-pending", "create:Unknown"], certificateClient.Events);
+        Assert.Equal("inProgress", Assert.IsType<FakePendingOperation>(certificateClient.Pending).Status);
         AssertRebuiltCsr(csr, key, policyItem.DnsNames);
+    }
+
+    [Fact]
+    public async Task CreateCsrWithoutBasicConstraintsAsync_WhenConflictIsNotCausedByPendingOperation_Rethrows()
+    {
+        using var key = RSA.Create(2048);
+        var certificateClient = new FakeCertificateClient(TestCertificateName) { ConflictWithoutPendingOperation = true };
+        certificateClient.Current = certificateClient.CreateVersion(key);
+        var signers = new SignerRecorder(certificateClient);
+
+        var exception = await Assert.ThrowsAsync<RequestFailedException>(() => CreateCsrWithoutBasicConstraintsAsync(certificateClient, CreatePolicyItem(), signers));
+
+        Assert.Equal(409, exception.Status);
+        Assert.Equal(["get-certificate", "create:Unknown", "conflict", "get-pending"], certificateClient.Events);
+        Assert.Empty(signers.Signers);
+    }
+
+    [Fact]
+    public async Task CreateCsrWithoutBasicConstraintsAsync_WhenConflictPersists_PropagatesAfterOneRecreate()
+    {
+        using var key = RSA.Create(2048);
+        var certificateClient = new FakeCertificateClient(TestCertificateName);
+        certificateClient.Current = certificateClient.CreateVersion(key);
+        certificateClient.Pending = FakeCertificateClient.CreatePendingOperation(key, "inProgress");
+        certificateClient.BeforeNextGetPendingOperation = () => certificateClient.ConflictWithoutPendingOperation = true;
+        var signers = new SignerRecorder(certificateClient);
+
+        var exception = await Assert.ThrowsAsync<RequestFailedException>(() => CreateCsrWithoutBasicConstraintsAsync(certificateClient, CreatePolicyItem(), signers));
+
+        Assert.Equal(409, exception.Status);
+        Assert.Equal(["get-certificate", "create:Unknown", "conflict", "get-pending", "delete:inProgress", "create:Unknown", "conflict"], certificateClient.Events);
+        Assert.Empty(signers.Signers);
     }
 
     [Fact]
@@ -281,18 +351,21 @@ public sealed class AcmeOrderActivitiesTests
         Assert.Equal(["get-certificate", "get-pending", "delete:inProgress", "create:Self", "create:Unknown"], certificateClient.Events);
     }
 
-    [Fact]
-    public async Task CreateCsrWithoutBasicConstraintsAsync_WithUnusableCertificateAndCompletedPendingOperation_DeletesIt()
+    [Theory]
+    [InlineData("completed")]
+    [InlineData("failed")]
+    [InlineData("cancelled")]
+    public async Task CreateCsrWithoutBasicConstraintsAsync_WithUnusableCertificateAndFinishedPendingOperation_KeepsIt(string status)
     {
         using var key = RSA.Create(2048);
         var certificateClient = new FakeCertificateClient(TestCertificateName);
         var now = DateTimeOffset.UtcNow;
         certificateClient.Current = certificateClient.CreateVersion(key, now.AddDays(-30), now.AddDays(-1));
-        certificateClient.Pending = FakeCertificateClient.CreatePendingOperation(key, "completed");
+        certificateClient.Pending = FakeCertificateClient.CreatePendingOperation(key, status);
 
         await CreateCsrWithoutBasicConstraintsAsync(certificateClient, CreatePolicyItem(), new SignerRecorder(certificateClient));
 
-        Assert.Equal(["get-certificate", "get-pending", "delete:completed", "create:Self", "create:Unknown"], certificateClient.Events);
+        Assert.Equal(["get-certificate", "get-pending", "create:Self", "create:Unknown"], certificateClient.Events);
     }
 
     private const string TestCertificateName = "example-com";
