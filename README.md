@@ -39,6 +39,7 @@ Acmebot is designed for teams that need to:
 - Independent renewal state and next-check timing per certificate, built for long-running certificate fleets
 - Support for ACME v2 compliant Certification Authorities
   - [Let's Encrypt](https://letsencrypt.org/)
+  - [AWS Certificate Manager](https://docs.aws.amazon.com/acm/latest/userguide/acm-acme.html) (Requires EAB Credentials and `Acmebot__ExcludeCsrBasicConstraints=true`)
   - [GlobalSign](https://www.globalsign.com/) (Requires EAB Credentials)
   - [Google Trust Services](https://pki.goog/) (Requires EAB Credentials)
   - [SSL.com](https://www.ssl.com/how-to/order-free-90-day-ssl-tls-certificates-with-acme/) (Requires EAB Credentials)
