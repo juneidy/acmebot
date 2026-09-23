@@ -44,6 +44,20 @@ internal static class TestCertificates
         return certificate.RawData;
     }
 
+    public static byte[] CreateIssuedCertificate(AsymmetricAlgorithm key, DateTimeOffset notBefore, DateTimeOffset notAfter, string subjectName = "CN=example.com")
+    {
+        using var issuerKey = RSA.Create(2048);
+
+        var issuerRequest = new CertificateRequest("CN=Test CA", issuerKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+        issuerRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+
+        using var issuer = issuerRequest.CreateSelfSigned(notBefore.AddDays(-1), notAfter.AddDays(1));
+        using var certificate = CreateRequest(subjectName, key).Create(issuer, notBefore, notAfter, [1, 2, 3, 4]);
+
+        return certificate.RawData;
+    }
+
     private static CertificateRequest CreateRequest(string subjectName, AsymmetricAlgorithm key) => key switch
     {
         RSA rsa => new CertificateRequest(subjectName, rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1),

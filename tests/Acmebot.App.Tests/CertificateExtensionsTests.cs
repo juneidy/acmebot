@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Security.Cryptography;
+using System.Text.Json;
 
 using Acmebot.App.Extensions;
 using Acmebot.App.Models;
@@ -146,6 +147,54 @@ public sealed class CertificateExtensionsTests
         using var metadata = JsonDocument.Parse(tags["Acmebot"]);
         Assert.Equal("tlsserver", metadata.RootElement.GetProperty("profile").GetString());
         Assert.Equal("certificate-id", metadata.RootElement.GetProperty("certificateId").GetString());
+    }
+
+    [Fact]
+    public void IsSelfSignedKeyHolder_WithSelfSignedManagedVersionWithoutCertificateId_ReturnsTrue()
+    {
+        Assert.True(CreateKeyVaultCertificate(selfSigned: true, ("Acmebot", """{"endpoint":"acme-v02.api.letsencrypt.org"}""")).IsSelfSignedKeyHolder());
+    }
+
+    [Fact]
+    public void IsSelfSignedKeyHolder_WithCertificateId_ReturnsFalse()
+    {
+        Assert.False(CreateKeyVaultCertificate(selfSigned: true, ("Acmebot", """{"endpoint":"acme-v02.api.letsencrypt.org","certificateId":"aki.serial"}""")).IsSelfSignedKeyHolder());
+    }
+
+    [Fact]
+    public void IsSelfSignedKeyHolder_WithIssuedCertificate_ReturnsFalse()
+    {
+        Assert.False(CreateKeyVaultCertificate(selfSigned: false, ("Acmebot", """{"endpoint":"acme-v02.api.letsencrypt.org"}""")).IsSelfSignedKeyHolder());
+    }
+
+    [Fact]
+    public void IsSelfSignedKeyHolder_WithoutAcmebotTag_ReturnsFalse()
+    {
+        Assert.False(CreateKeyVaultCertificate(selfSigned: true).IsSelfSignedKeyHolder());
+    }
+
+    [Fact]
+    public void IsSelfSignedKeyHolder_WithoutCer_ReturnsFalse()
+    {
+        using var key = RSA.Create(2048);
+        var certificateClient = new FakeCertificateClient("example-com");
+        var tags = new Dictionary<string, string> { ["Acmebot"] = """{"endpoint":"acme-v02.api.letsencrypt.org"}""" };
+        var version = certificateClient.CreateVersion(key, tags: tags) with { Cer = null };
+
+        Assert.False(certificateClient.ToKeyVaultCertificate(version).IsSelfSignedKeyHolder());
+    }
+
+    private static KeyVaultCertificate CreateKeyVaultCertificate(bool selfSigned, params (string Key, string Value)[] tags)
+    {
+        using var key = RSA.Create(2048);
+        var now = DateTimeOffset.UtcNow;
+        var certificateClient = new FakeCertificateClient("example-com");
+        var cer = selfSigned
+            ? TestCertificates.CreateSelfSignedCertificate(key, now.AddDays(-1), now.AddDays(30))
+            : TestCertificates.CreateIssuedCertificate(key, now.AddDays(-1), now.AddDays(30));
+        var version = certificateClient.CreateVersion(key, tags: tags.ToDictionary(x => x.Key, x => x.Value), cer: cer);
+
+        return certificateClient.ToKeyVaultCertificate(version);
     }
 
     private static CertificatePolicyItem CreatePolicy(string? profile)
