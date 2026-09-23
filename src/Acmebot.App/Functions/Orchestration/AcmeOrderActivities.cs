@@ -103,7 +103,7 @@ public partial class AcmeOrderActivities(
         var (certificatePolicyItem, orderDetails) = input;
 
         var csr = _options.ExcludeCsrBasicConstraints
-            ? await CreateCsrWithoutBasicConstraintsAsync(certificatePolicyItem)
+            ? await CreateCsrWithoutBasicConstraintsAsync(certificateClient, keyId => new CryptographyClient(keyId, credential), certificatePolicyItem, _options.Endpoint, logger)
             : await CreateKeyVaultCsrAsync(certificatePolicyItem);
 
         var acmeContext = await acmeClientFactory.CreateClientAsync();
@@ -193,16 +193,22 @@ public partial class AcmeOrderActivities(
     // Key Vault always adds Basic Constraints to the CSR it generates, and the Keys API can only sign with the key of a completed
     // certificate version. So the CSR is rebuilt without the extension, signed with the current version's key, and the issued
     // certificate is merged into a new version that reuses that key.
-    private async Task<byte[]> CreateCsrWithoutBasicConstraintsAsync(CertificatePolicyItem certificatePolicyItem)
+    internal static async Task<byte[]> CreateCsrWithoutBasicConstraintsAsync(
+        CertificateClient certificateClient,
+        Func<Uri, CryptographyClient> cryptographyClientFactory,
+        CertificatePolicyItem certificatePolicyItem,
+        Uri endpoint,
+        ILogger logger,
+        CancellationToken cancellationToken = default)
     {
-        var signingCertificate = await GetSigningCertificateAsync(certificatePolicyItem.CertificateName)
-                                 ?? await CreateSelfSignedCertificateAsync(certificatePolicyItem);
+        var signingCertificate = await GetSigningCertificateAsync(certificateClient, certificatePolicyItem.CertificateName, cancellationToken)
+                                 ?? await CreateSelfSignedCertificateAsync(certificateClient, certificatePolicyItem, endpoint, logger, cancellationToken);
 
         using var x509Certificate = X509CertificateLoader.LoadCertificate(signingCertificate.Cer);
 
-        var certificateOperation = await StartReuseKeyCertificateOperationAsync(certificatePolicyItem, x509Certificate.PublicKey);
+        var certificateOperation = await StartReuseKeyCertificateOperationAsync(certificateClient, certificatePolicyItem, endpoint, x509Certificate.PublicKey, logger, cancellationToken);
 
-        var cryptographyClient = new CryptographyClient(signingCertificate.KeyId, credential);
+        var cryptographyClient = cryptographyClientFactory(signingCertificate.KeyId);
 
         try
         {
@@ -214,13 +220,13 @@ public partial class AcmeOrderActivities(
         }
     }
 
-    private async Task<KeyVaultCertificateWithPolicy?> GetSigningCertificateAsync(string certificateName)
+    private static async Task<KeyVaultCertificateWithPolicy?> GetSigningCertificateAsync(CertificateClient certificateClient, string certificateName, CancellationToken cancellationToken)
     {
         KeyVaultCertificateWithPolicy certificate;
 
         try
         {
-            certificate = (await certificateClient.GetCertificateAsync(certificateName)).Value;
+            certificate = (await certificateClient.GetCertificateAsync(certificateName, cancellationToken)).Value;
         }
         catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.NotFound)
         {
@@ -240,12 +246,12 @@ public partial class AcmeOrderActivities(
         return isUsable ? certificate : null;
     }
 
-    private async Task<KeyVaultCertificateWithPolicy> CreateSelfSignedCertificateAsync(CertificatePolicyItem certificatePolicyItem)
+    private static async Task<KeyVaultCertificateWithPolicy> CreateSelfSignedCertificateAsync(CertificateClient certificateClient, CertificatePolicyItem certificatePolicyItem, Uri endpoint, ILogger logger, CancellationToken cancellationToken)
     {
         LogCreatingSelfSignedCertificate(logger, certificatePolicyItem.CertificateName);
 
         // An in-progress pending operation blocks creating a new version
-        await DeletePendingCertificateOperationAsync(certificatePolicyItem.CertificateName);
+        await DeletePendingCertificateOperationAsync(certificateClient, certificatePolicyItem.CertificateName, cancellationToken);
 
         // The self-signed version only holds the new key until the issued certificate is merged. A short validity lets
         // scheduled renewal pick it up again if issuance fails after this point.
@@ -256,26 +262,27 @@ public partial class AcmeOrderActivities(
         var certificateOperation = await certificateClient.StartCreateCertificateAsync(
             certificatePolicyItem.CertificateName,
             certificatePolicy,
-            tags: certificatePolicyItem.ToCertificateTags(_options.Endpoint));
+            tags: certificatePolicyItem.ToCertificateTags(endpoint),
+            cancellationToken: cancellationToken);
 
-        return (await certificateOperation.WaitForCompletionAsync()).Value;
+        return (await certificateOperation.WaitForCompletionAsync(cancellationToken)).Value;
     }
 
-    private async Task<CertificateOperation> StartReuseKeyCertificateOperationAsync(CertificatePolicyItem certificatePolicyItem, PublicKey signingPublicKey)
+    private static async Task<CertificateOperation> StartReuseKeyCertificateOperationAsync(CertificateClient certificateClient, CertificatePolicyItem certificatePolicyItem, Uri endpoint, PublicKey signingPublicKey, ILogger logger, CancellationToken cancellationToken)
     {
         var certificateName = certificatePolicyItem.CertificateName;
         var certificatePolicy = certificatePolicyItem.ToCertificatePolicy(reuseKey: true);
-        var tags = certificatePolicyItem.ToCertificateTags(_options.Endpoint);
+        var tags = certificatePolicyItem.ToCertificateTags(endpoint);
 
         CertificateOperation certificateOperation;
 
         try
         {
-            certificateOperation = await certificateClient.StartCreateCertificateAsync(certificateName, certificatePolicy, tags: tags, preserveCertificateOrder: true);
+            certificateOperation = await certificateClient.StartCreateCertificateAsync(certificateName, certificatePolicy, tags: tags, preserveCertificateOrder: true, cancellationToken: cancellationToken);
         }
         catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.Conflict)
         {
-            certificateOperation = await certificateClient.GetCertificateOperationAsync(certificateName);
+            certificateOperation = await certificateClient.GetCertificateOperationAsync(certificateName, cancellationToken);
 
             if (KeyVaultCsrSigner.HasSamePublicKey(KeyVaultCsrSigner.GetPublicKey(certificateOperation.Properties.Csr), signingPublicKey))
             {
@@ -285,9 +292,9 @@ public partial class AcmeOrderActivities(
             // A pending operation left by an earlier attempt holds a different key, so the issued certificate could not be merged into it
             LogReplacingPendingCertificateOperation(logger, certificateName);
 
-            await certificateOperation.DeleteAsync();
+            await certificateOperation.DeleteAsync(cancellationToken);
 
-            certificateOperation = await certificateClient.StartCreateCertificateAsync(certificateName, certificatePolicy, tags: tags, preserveCertificateOrder: true);
+            certificateOperation = await certificateClient.StartCreateCertificateAsync(certificateName, certificatePolicy, tags: tags, preserveCertificateOrder: true, cancellationToken: cancellationToken);
         }
 
         if (!KeyVaultCsrSigner.HasSamePublicKey(KeyVaultCsrSigner.GetPublicKey(certificateOperation.Properties.Csr), signingPublicKey))
@@ -298,15 +305,15 @@ public partial class AcmeOrderActivities(
         return certificateOperation;
     }
 
-    private async Task DeletePendingCertificateOperationAsync(string certificateName)
+    private static async Task DeletePendingCertificateOperationAsync(CertificateClient certificateClient, string certificateName, CancellationToken cancellationToken)
     {
         try
         {
-            var certificateOperation = await certificateClient.GetCertificateOperationAsync(certificateName);
+            var certificateOperation = await certificateClient.GetCertificateOperationAsync(certificateName, cancellationToken);
 
             if (!certificateOperation.HasCompleted)
             {
-                await certificateOperation.DeleteAsync();
+                await certificateOperation.DeleteAsync(cancellationToken);
             }
         }
         catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.NotFound)

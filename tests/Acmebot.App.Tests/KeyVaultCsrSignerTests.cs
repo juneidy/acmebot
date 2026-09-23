@@ -5,9 +5,6 @@ using System.Security.Cryptography.X509Certificates;
 
 using Acmebot.App.Acme;
 
-using Azure.Security.KeyVault.Keys;
-using Azure.Security.KeyVault.Keys.Cryptography;
-
 using Xunit;
 
 namespace Acmebot.App.Tests;
@@ -24,8 +21,8 @@ public sealed class KeyVaultCsrSignerTests
     [InlineData("EC-P521")]
     public void RebuildWithoutBasicConstraints_RemovesOnlyBasicConstraints(string keyType)
     {
-        using var key = CreateKey(keyType);
-        var templateCsr = CreateKeyVaultStyleCsr(key);
+        using var key = TestCertificates.CreateKey(keyType);
+        var templateCsr = TestCertificates.CreateKeyVaultStyleCsr(key);
 
         var csr = KeyVaultCsrSigner.RebuildWithoutBasicConstraints(templateCsr, new FakeCryptographyClient(key));
 
@@ -59,10 +56,10 @@ public sealed class KeyVaultCsrSignerTests
     [InlineData("EC-P521", "ES512")]
     public void RebuildWithoutBasicConstraints_UsesKeyVaultAlgorithmForKey(string keyType, string expectedAlgorithm)
     {
-        using var key = CreateKey(keyType);
+        using var key = TestCertificates.CreateKey(keyType);
         var signer = new FakeCryptographyClient(key);
 
-        KeyVaultCsrSigner.RebuildWithoutBasicConstraints(CreateKeyVaultStyleCsr(key), signer);
+        KeyVaultCsrSigner.RebuildWithoutBasicConstraints(TestCertificates.CreateKeyVaultStyleCsr(key), signer);
 
         Assert.Equal(expectedAlgorithm, Assert.Single(signer.Algorithms).ToString());
     }
@@ -73,7 +70,7 @@ public sealed class KeyVaultCsrSignerTests
         using var templateKey = RSA.Create(2048);
         using var otherKey = RSA.Create(2048);
 
-        var templateCsr = CreateKeyVaultStyleCsr(templateKey);
+        var templateCsr = TestCertificates.CreateKeyVaultStyleCsr(templateKey);
 
         Assert.ThrowsAny<CryptographicException>(() => KeyVaultCsrSigner.RebuildWithoutBasicConstraints(templateCsr, new FakeCryptographyClient(otherKey)));
     }
@@ -121,57 +118,5 @@ public sealed class KeyVaultCsrSignerTests
         }
     }
 
-    private static AsymmetricAlgorithm CreateKey(string keyType) => keyType switch
-    {
-        "RSA-2048" => RSA.Create(2048),
-        "EC-P256" => ECDsa.Create(ECCurve.NamedCurves.nistP256),
-        "EC-P384" => ECDsa.Create(ECCurve.NamedCurves.nistP384),
-        "EC-P521" => ECDsa.Create(ECCurve.NamedCurves.nistP521),
-        _ => throw new ArgumentOutOfRangeException(nameof(keyType))
-    };
-
-    // Mirrors the extensions Key Vault puts in the CSRs it generates
-    private static byte[] CreateKeyVaultStyleCsr(AsymmetricAlgorithm key)
-    {
-        var request = key switch
-        {
-            RSA rsa => new CertificateRequest("CN=example.com", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1),
-            ECDsa ecdsa => new CertificateRequest("CN=example.com", ecdsa, HashAlgorithmName.SHA256),
-            _ => throw new NotSupportedException()
-        };
-
-        var subjectAlternativeNames = new SubjectAlternativeNameBuilder();
-
-        subjectAlternativeNames.AddDnsName("example.com");
-        subjectAlternativeNames.AddDnsName("www.example.com");
-
-        request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, critical: true));
-        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, critical: false));
-        request.CertificateExtensions.Add(subjectAlternativeNames.Build());
-        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, false));
-
-        return request.CreateSigningRequest();
-    }
-
     private static CertificateRequest Load(byte[] csr) => CertificateRequest.LoadSigningRequest(csr, HashAlgorithmName.SHA256, CertificateRequestLoadOptions.UnsafeLoadCertificateExtensions);
-
-    // Signs locally the way Key Vault does: PKCS#1 v1.5 for RSA, IEEE P1363 (r || s) for ECDSA
-    private sealed class FakeCryptographyClient(AsymmetricAlgorithm key) : CryptographyClient
-    {
-        public List<SignatureAlgorithm> Algorithms { get; } = [];
-
-        public override SignResult Sign(SignatureAlgorithm algorithm, byte[] digest, CancellationToken cancellationToken = default)
-        {
-            Algorithms.Add(algorithm);
-
-            var signature = key switch
-            {
-                RSA rsa => rsa.SignHash(digest, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1),
-                ECDsa ecdsa => ecdsa.SignHash(digest),
-                _ => throw new NotSupportedException()
-            };
-
-            return CryptographyModelFactory.SignResult("https://example.vault.azure.net/keys/test/1", signature, algorithm);
-        }
-    }
 }
