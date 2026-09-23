@@ -48,6 +48,7 @@ Recommended scopes:
 | Resource | Permission |
 | --- | --- |
 | Key Vault | `Key Vault Certificates Officer` or equivalent certificate permissions. |
+| Key Vault (only with `Acmebot__ExcludeCsrBasicConstraints`) | `Key Vault Crypto User`, or a custom role with `keys/read` and `keys/sign`, to sign the rebuilt CSR. |
 | Azure DNS zone | `DNS Zone Contributor` or a narrower custom role. |
 | Azure Private DNS zone | `Private DNS Zone Contributor` or a narrower custom role. |
 | Route 53 IAM role | Trust policy that allows the selected managed identity web identity token to assume the role. |
@@ -71,6 +72,8 @@ Recommendations:
 ## Key Vault
 
 Acmebot stores private keys in Key Vault. It creates certificate operations and merges the issued public certificate chain into the pending operation.
+
+When `Acmebot__ExcludeCsrBasicConstraints` is enabled, Acmebot rebuilds the CSR without Basic Constraints and asks Key Vault to sign a digest of it with the current certificate version's key. The private key still never leaves Key Vault, but it is reused across renewals instead of being rotated.
 
 Recommendations:
 

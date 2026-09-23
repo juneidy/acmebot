@@ -31,6 +31,9 @@ public class AcmebotOptions
 
     public string? PreferredProfile { get; set; }
 
+    // Rebuild the Key Vault CSR without Basic Constraints and sign it with the current Key Vault key (the key is reused on renewal)
+    public bool ExcludeCsrBasicConstraints { get; set; } = false;
+
     // Properties should be in alphabetical order
     public AkamaiEdgeDnsOptions? Akamai { get; set; }
 

@@ -9,7 +9,9 @@ using Acmebot.App.Extensions;
 using Acmebot.App.Models;
 using Acmebot.App.Options;
 
+using Azure.Core;
 using Azure.Security.KeyVault.Certificates;
+using Azure.Security.KeyVault.Keys.Cryptography;
 
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
@@ -20,6 +22,7 @@ namespace Acmebot.App.Functions.Orchestration;
 public partial class AcmeOrderActivities(
     AcmeClientFactory acmeClientFactory,
     CertificateClient certificateClient,
+    TokenCredential credential,
     IOptions<AcmebotOptions> options,
     ILogger<AcmeOrderActivities> logger)
 {
@@ -99,27 +102,9 @@ public partial class AcmeOrderActivities(
     {
         var (certificatePolicyItem, orderDetails) = input;
 
-        byte[] csr;
-
-        try
-        {
-            var certificatePolicy = certificatePolicyItem.ToCertificatePolicy();
-            var tags = certificatePolicyItem.ToCertificateTags(_options.Endpoint);
-
-            var certificateOperation = await certificateClient.StartCreateCertificateAsync(
-                certificatePolicyItem.CertificateName,
-                certificatePolicy,
-                tags: tags,
-                preserveCertificateOrder: true);
-
-            csr = certificateOperation.Properties.Csr;
-        }
-        catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.Conflict)
-        {
-            var certificateOperation = await certificateClient.GetCertificateOperationAsync(certificatePolicyItem.CertificateName);
-
-            csr = certificateOperation.Properties.Csr;
-        }
+        var csr = _options.ExcludeCsrBasicConstraints
+            ? await CreateCsrWithoutBasicConstraintsAsync(certificatePolicyItem)
+            : await CreateKeyVaultCsrAsync(certificatePolicyItem);
 
         var acmeContext = await acmeClientFactory.CreateClientAsync();
 
@@ -181,6 +166,160 @@ public partial class AcmeOrderActivities(
 
         return mergedCertificate.ToCertificateItem();
     }
+
+    private async Task<byte[]> CreateKeyVaultCsrAsync(CertificatePolicyItem certificatePolicyItem)
+    {
+        try
+        {
+            var certificatePolicy = certificatePolicyItem.ToCertificatePolicy();
+            var tags = certificatePolicyItem.ToCertificateTags(_options.Endpoint);
+
+            var certificateOperation = await certificateClient.StartCreateCertificateAsync(
+                certificatePolicyItem.CertificateName,
+                certificatePolicy,
+                tags: tags,
+                preserveCertificateOrder: true);
+
+            return certificateOperation.Properties.Csr;
+        }
+        catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.Conflict)
+        {
+            var certificateOperation = await certificateClient.GetCertificateOperationAsync(certificatePolicyItem.CertificateName);
+
+            return certificateOperation.Properties.Csr;
+        }
+    }
+
+    // Key Vault always adds Basic Constraints to the CSR it generates, and the Keys API can only sign with the key of a completed
+    // certificate version. So the CSR is rebuilt without the extension, signed with the current version's key, and the issued
+    // certificate is merged into a new version that reuses that key.
+    private async Task<byte[]> CreateCsrWithoutBasicConstraintsAsync(CertificatePolicyItem certificatePolicyItem)
+    {
+        var signingCertificate = await GetSigningCertificateAsync(certificatePolicyItem.CertificateName)
+                                 ?? await CreateSelfSignedCertificateAsync(certificatePolicyItem);
+
+        using var x509Certificate = X509CertificateLoader.LoadCertificate(signingCertificate.Cer);
+
+        var certificateOperation = await StartReuseKeyCertificateOperationAsync(certificatePolicyItem, x509Certificate.PublicKey);
+
+        var cryptographyClient = new CryptographyClient(signingCertificate.KeyId, credential);
+
+        try
+        {
+            return KeyVaultCsrSigner.RebuildWithoutBasicConstraints(certificateOperation.Properties.Csr, cryptographyClient);
+        }
+        catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.Forbidden)
+        {
+            throw new InvalidOperationException("Key Vault denied signing the CSR. ExcludeCsrBasicConstraints requires the Acmebot identity to have the Key Vault Crypto User role (or keys/sign permission) on the vault.", ex);
+        }
+    }
+
+    private async Task<KeyVaultCertificateWithPolicy?> GetSigningCertificateAsync(string certificateName)
+    {
+        KeyVaultCertificateWithPolicy certificate;
+
+        try
+        {
+            certificate = (await certificateClient.GetCertificateAsync(certificateName)).Value;
+        }
+        catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.NotFound)
+        {
+            return null;
+        }
+
+        // Key Vault refuses key operations on a disabled or expired certificate version
+        var now = DateTimeOffset.UtcNow;
+        var properties = certificate.Properties;
+
+        var isUsable = certificate.Cer is { Length: > 0 } &&
+                       certificate.KeyId is not null &&
+                       properties.Enabled != false &&
+                       properties.NotBefore.GetValueOrDefault(DateTimeOffset.MinValue) <= now &&
+                       properties.ExpiresOn.GetValueOrDefault(DateTimeOffset.MinValue) > now;
+
+        return isUsable ? certificate : null;
+    }
+
+    private async Task<KeyVaultCertificateWithPolicy> CreateSelfSignedCertificateAsync(CertificatePolicyItem certificatePolicyItem)
+    {
+        LogCreatingSelfSignedCertificate(logger, certificatePolicyItem.CertificateName);
+
+        // An in-progress pending operation blocks creating a new version
+        await DeletePendingCertificateOperationAsync(certificatePolicyItem.CertificateName);
+
+        // The self-signed version only holds the new key until the issued certificate is merged. A short validity lets
+        // scheduled renewal pick it up again if issuance fails after this point.
+        var certificatePolicy = certificatePolicyItem.ToCertificatePolicy(issuerName: WellKnownIssuerNames.Self, reuseKey: false);
+
+        certificatePolicy.ValidityInMonths = 1;
+
+        var certificateOperation = await certificateClient.StartCreateCertificateAsync(
+            certificatePolicyItem.CertificateName,
+            certificatePolicy,
+            tags: certificatePolicyItem.ToCertificateTags(_options.Endpoint));
+
+        return (await certificateOperation.WaitForCompletionAsync()).Value;
+    }
+
+    private async Task<CertificateOperation> StartReuseKeyCertificateOperationAsync(CertificatePolicyItem certificatePolicyItem, PublicKey signingPublicKey)
+    {
+        var certificateName = certificatePolicyItem.CertificateName;
+        var certificatePolicy = certificatePolicyItem.ToCertificatePolicy(reuseKey: true);
+        var tags = certificatePolicyItem.ToCertificateTags(_options.Endpoint);
+
+        CertificateOperation certificateOperation;
+
+        try
+        {
+            certificateOperation = await certificateClient.StartCreateCertificateAsync(certificateName, certificatePolicy, tags: tags, preserveCertificateOrder: true);
+        }
+        catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.Conflict)
+        {
+            certificateOperation = await certificateClient.GetCertificateOperationAsync(certificateName);
+
+            if (KeyVaultCsrSigner.HasSamePublicKey(KeyVaultCsrSigner.GetPublicKey(certificateOperation.Properties.Csr), signingPublicKey))
+            {
+                return certificateOperation;
+            }
+
+            // A pending operation left by an earlier attempt holds a different key, so the issued certificate could not be merged into it
+            LogReplacingPendingCertificateOperation(logger, certificateName);
+
+            await certificateOperation.DeleteAsync();
+
+            certificateOperation = await certificateClient.StartCreateCertificateAsync(certificateName, certificatePolicy, tags: tags, preserveCertificateOrder: true);
+        }
+
+        if (!KeyVaultCsrSigner.HasSamePublicKey(KeyVaultCsrSigner.GetPublicKey(certificateOperation.Properties.Csr), signingPublicKey))
+        {
+            throw new InvalidOperationException("Key Vault did not reuse the current key for the new certificate version. Changing the key type, size, or curve of an existing certificate is not supported while ExcludeCsrBasicConstraints is enabled.");
+        }
+
+        return certificateOperation;
+    }
+
+    private async Task DeletePendingCertificateOperationAsync(string certificateName)
+    {
+        try
+        {
+            var certificateOperation = await certificateClient.GetCertificateOperationAsync(certificateName);
+
+            if (!certificateOperation.HasCompleted)
+            {
+                await certificateOperation.DeleteAsync();
+            }
+        }
+        catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.NotFound)
+        {
+            // No pending operation
+        }
+    }
+
+    [LoggerMessage(LogLevel.Information, "No usable Key Vault certificate version to sign the CSR with. Creating a self-signed version to hold a new key. CertificateName: {CertificateName}")]
+    private static partial void LogCreatingSelfSignedCertificate(ILogger logger, string certificateName);
+
+    [LoggerMessage(LogLevel.Warning, "Replacing a pending Key Vault certificate operation whose key differs from the current certificate key. CertificateName: {CertificateName}")]
+    private static partial void LogReplacingPendingCertificateOperation(ILogger logger, string certificateName);
 
     [LoggerMessage(LogLevel.Error, "ACME domain validation failed. ProblemDetails: {ProblemDetailsJson}")]
     private static partial void LogAcmeDomainValidationError(ILogger logger, string problemDetailsJson);
