@@ -368,6 +368,22 @@ public sealed class AcmeOrderActivitiesTests
         Assert.Equal(["get-certificate", "get-pending", "create:Self", "create:Unknown"], certificateClient.Events);
     }
 
+    [Fact]
+    public async Task CreateCsrWithoutBasicConstraintsAsync_WhenSigningIsForbidden_NamesRequiredPermissions()
+    {
+        using var key = RSA.Create(2048);
+        var certificateClient = new FakeCertificateClient(TestCertificateName);
+        certificateClient.Current = certificateClient.CreateVersion(key);
+        var forbidden = new RequestFailedException(403, "Forbidden");
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => CreateCsrWithoutBasicConstraintsAsync(certificateClient, CreatePolicyItem(), new SignerRecorder(certificateClient, forbidden)));
+
+        Assert.Contains("Key Vault Crypto User", exception.Message);
+        Assert.Contains("keys/read", exception.Message);
+        Assert.Contains("keys/sign", exception.Message);
+        Assert.Same(forbidden, exception.InnerException);
+    }
+
     private const string TestCertificateName = "example-com";
 
     private static readonly Uri s_acmeEndpoint = new("https://acme.example.com/directory");

@@ -216,7 +216,7 @@ public partial class AcmeOrderActivities(
         }
         catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.Forbidden)
         {
-            throw new InvalidOperationException("Key Vault denied signing the CSR. ExcludeCsrBasicConstraints requires the Acmebot identity to have the Key Vault Crypto User role (or keys/sign permission) on the vault.", ex);
+            throw new InvalidOperationException("Key Vault denied signing the CSR. ExcludeCsrBasicConstraints requires the Acmebot identity to have the Key Vault Crypto User role (or the keys/read and keys/sign permissions) on the vault.", ex);
         }
     }
 
