@@ -116,6 +116,22 @@ internal static class CertificateExtensions
         tags[AcmebotTagKey] = JsonSerializer.Serialize(metadata, s_jsonOptions);
     }
 
+    // With ExcludeCsrBasicConstraints, Acmebot creates a self-signed version to hold a new key until the issued certificate is
+    // merged. It is marked explicitly, because a certificate whose subject equals its issuer is only self-issued, not necessarily
+    // such a placeholder.
+    public static void SetKeyHolder(this IDictionary<string, string> tags)
+    {
+        ArgumentNullException.ThrowIfNull(tags);
+
+        var metadata = tags.GetAcmebotMetadata() ?? new AcmebotCertificateMetadata();
+
+        metadata.KeyHolder = true;
+
+        tags[AcmebotTagKey] = JsonSerializer.Serialize(metadata, s_jsonOptions);
+    }
+
+    public static bool IsKeyHolder(this CertificateProperties properties) => properties.Tags.GetAcmebotMetadata()?.KeyHolder == true;
+
     public static bool TryGetCertificateId(this CertificateProperties properties, [NotNullWhen(true)] out string? certificateId)
     {
         var metadata = properties.Tags.GetAcmebotMetadata();
@@ -200,5 +216,8 @@ internal static class CertificateExtensions
 
         [JsonPropertyName("certificateId")]
         public string? CertificateId { get; set; }
+
+        [JsonPropertyName("keyHolder")]
+        public bool? KeyHolder { get; set; }
     }
 }

@@ -6,7 +6,7 @@ namespace Acmebot.App.Extensions;
 
 internal static class CertificatePolicyExtensions
 {
-    public static CertificatePolicy ToCertificatePolicy(this CertificatePolicyItem certificatePolicyItem)
+    public static CertificatePolicy ToCertificatePolicy(this CertificatePolicyItem certificatePolicyItem, string? issuerName = null, bool? reuseKey = null)
     {
         var subjectAlternativeNames = new SubjectAlternativeNames();
 
@@ -15,10 +15,10 @@ internal static class CertificatePolicyExtensions
             subjectAlternativeNames.DnsNames.Add(dnsName);
         }
 
-        var certificatePolicy = new CertificatePolicy(WellKnownIssuerNames.Unknown, $"CN={certificatePolicyItem.DnsNames[0]}", subjectAlternativeNames)
+        var certificatePolicy = new CertificatePolicy(issuerName ?? WellKnownIssuerNames.Unknown, $"CN={certificatePolicyItem.DnsNames[0]}", subjectAlternativeNames)
         {
             KeySize = certificatePolicyItem.KeySize,
-            ReuseKey = certificatePolicyItem.ReuseKey,
+            ReuseKey = reuseKey ?? certificatePolicyItem.ReuseKey,
             EnhancedKeyUsage =
             {
                 "1.3.6.1.5.5.7.3.1"
