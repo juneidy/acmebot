@@ -73,7 +73,7 @@ Recommendations:
 
 Acmebot stores private keys in Key Vault. It creates certificate operations and merges the issued public certificate chain into the pending operation.
 
-When `Acmebot__ExcludeCsrBasicConstraints` is enabled, Acmebot rebuilds the CSR without Basic Constraints and asks Key Vault to sign a digest of it with the current certificate version's key. The private key still never leaves Key Vault, but it is reused across renewals instead of being rotated.
+When `Acmebot__ExcludeCsrBasicConstraints` is enabled, Acmebot rebuilds the CSR without Basic Constraints and asks Key Vault to sign a digest of it with the current certificate version's key. The private key still never leaves Key Vault, but it is reused across renewals instead of being rotated. Turning the option off does not restore rotation for certificates issued or attempted while it was on: their Key Vault policy keeps key reuse until each certificate is added again with Reuse key off.
 
 Recommendations:
 

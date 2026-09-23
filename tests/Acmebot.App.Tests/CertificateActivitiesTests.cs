@@ -43,6 +43,20 @@ public sealed class CertificateActivitiesTests
         Assert.Equal(createdOn.AddHours(1), evaluation.NextCheck);
     }
 
+    [Theory]
+    [InlineData(59, false)]
+    [InlineData(60, true)]
+    public void EvaluateCertificateState_WithKeyHolderAtGracePeriodBoundary_RenewsOnlyAfterOneHour(int minutesSinceCreated, bool shouldRenew)
+    {
+        var now = new DateTimeOffset(2026, 9, 24, 12, 0, 0, TimeSpan.Zero);
+        var certificate = CreateKeyHolder(now.AddMinutes(-minutesSinceCreated), now.AddDays(30));
+
+        var evaluation = CertificateActivities.EvaluateCertificateState(certificate, s_endpoint, now);
+
+        Assert.NotNull(evaluation);
+        Assert.Equal(shouldRenew, evaluation.ShouldRenew);
+    }
+
     [Fact]
     public void EvaluateCertificateState_WithExpiredKeyHolder_RenewsImmediately()
     {
@@ -109,7 +123,7 @@ public sealed class CertificateActivitiesTests
     {
         using var key = RSA.Create(2048);
         var certificateClient = new FakeCertificateClient("example-com");
-        var version = certificateClient.CreateVersion(key, createdOn, expiresOn, CreateTags(withCertificateId: false));
+        var version = certificateClient.CreateVersion(key, createdOn.AddMinutes(-5), expiresOn, CreateTags(withCertificateId: false));
 
         return certificateClient.ToKeyVaultCertificate(version with { CreatedOn = createdOn, Enabled = enabled });
     }

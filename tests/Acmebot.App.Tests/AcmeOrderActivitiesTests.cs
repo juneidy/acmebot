@@ -165,6 +165,7 @@ public sealed class AcmeOrderActivitiesTests
 
         var holder = certificateClient.Creates[0];
         Assert.False(holder.ReuseKey);
+        Assert.Equal(1, holder.ValidityInMonths);
         AssertTags(policyItem.ToCertificateTags(s_acmeEndpoint), holder.Tags);
         Assert.True(certificateClient.Creates[1].ReuseKey);
 
@@ -336,19 +337,47 @@ public sealed class AcmeOrderActivitiesTests
         Assert.Empty(signers.Signers);
     }
 
-    [Fact]
-    public async Task CreateCsrWithoutBasicConstraintsAsync_WithUnusableCertificateAndInProgressPendingOperation_DeletesItBeforeCreatingKeyHolder()
+    [Theory]
+    [InlineData("inProgress")]
+    [InlineData("InProgress")]
+    public async Task CreateCsrWithoutBasicConstraintsAsync_WithUnusableCertificateAndInProgressPendingOperation_DeletesItBeforeCreatingKeyHolder(string status)
     {
         using var key = RSA.Create(2048);
         using var otherKey = RSA.Create(2048);
         var certificateClient = new FakeCertificateClient(TestCertificateName);
         var now = DateTimeOffset.UtcNow;
         certificateClient.Current = certificateClient.CreateVersion(key, now.AddDays(-30), now.AddDays(-1));
-        certificateClient.Pending = FakeCertificateClient.CreatePendingOperation(otherKey, "inProgress");
+        certificateClient.Pending = FakeCertificateClient.CreatePendingOperation(otherKey, status);
 
         await CreateCsrWithoutBasicConstraintsAsync(certificateClient, CreatePolicyItem(), new SignerRecorder(certificateClient));
 
-        Assert.Equal(["get-certificate", "get-pending", "delete:inProgress", "create:Self", "create:Unknown"], certificateClient.Events);
+        Assert.Equal(["get-certificate", "get-pending", $"delete:{status}", "create:Self", "create:Unknown"], certificateClient.Events);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CreateCsrWithoutBasicConstraintsAsync_WhenPendingOperationIsRemovedBeforeDelete_CarriesOn(bool certificateUsable)
+    {
+        using var key = RSA.Create(2048);
+        var certificateClient = new FakeCertificateClient(TestCertificateName);
+        var now = DateTimeOffset.UtcNow;
+        certificateClient.Current = certificateUsable ? certificateClient.CreateVersion(key) : certificateClient.CreateVersion(key, now.AddDays(-30), now.AddDays(-1));
+        certificateClient.Pending = FakeCertificateClient.CreatePendingOperation(key, "inProgress");
+
+        // A concurrent run removes the operation between the lookup and the delete, so the delete returns 404
+        certificateClient.BeforeNextDeletePendingOperation = () => certificateClient.Pending = null;
+
+        var policyItem = CreatePolicyItem();
+
+        var csr = await CreateCsrWithoutBasicConstraintsAsync(certificateClient, policyItem, new SignerRecorder(certificateClient));
+
+        string[] expectedEvents = certificateUsable
+            ? ["get-certificate", "create:Unknown", "conflict", "get-pending", "delete:missing", "create:Unknown"]
+            : ["get-certificate", "get-pending", "delete:missing", "create:Self", "create:Unknown"];
+
+        Assert.Equal(expectedEvents, certificateClient.Events);
+        AssertRebuiltCsr(csr, Assert.IsType<FakeCertificateVersion>(certificateClient.Current).Key, policyItem.DnsNames);
     }
 
     [Theory]

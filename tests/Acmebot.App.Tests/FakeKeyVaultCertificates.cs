@@ -29,7 +29,8 @@ internal sealed record FakeCreateRequest(
     bool? ReuseKey,
     bool? PreserveCertificateOrder,
     IReadOnlyList<string> DnsNames,
-    IReadOnlyDictionary<string, string> Tags);
+    IReadOnlyDictionary<string, string> Tags,
+    int? ValidityInMonths);
 
 // Models Key Vault for a single certificate name. Creating a version fails with 409 only while the pending
 // operation is in progress, and replaces a completed, failed or cancelled one:
@@ -61,6 +62,9 @@ internal sealed class FakeCertificateClient(string name) : CertificateClient
 
     // Runs once, just before the next pending operation lookup, to model a change made by a concurrent run
     public Action? BeforeNextGetPendingOperation { get; set; }
+
+    // Runs once, just before the next pending operation delete, to model a change made by a concurrent run
+    public Action? BeforeNextDeletePendingOperation { get; set; }
 
     public FakeCertificateVersion CreateVersion(
         AsymmetricAlgorithm key,
@@ -147,7 +151,7 @@ internal sealed class FakeCertificateClient(string name) : CertificateClient
         var requestedTags = new Dictionary<string, string>(tags ?? new Dictionary<string, string>());
         var dnsNames = policy.SubjectAlternativeNames?.DnsNames.ToArray() ?? [];
 
-        Creates.Add(new FakeCreateRequest(policy.IssuerName, policy.ReuseKey, preserveCertificateOrder, dnsNames, requestedTags));
+        Creates.Add(new FakeCreateRequest(policy.IssuerName, policy.ReuseKey, preserveCertificateOrder, dnsNames, requestedTags, policy.ValidityInMonths));
         Events.Add($"create:{policy.IssuerName}");
 
         if (ConflictWithoutPendingOperation || string.Equals(Pending?.Status, "inProgress", StringComparison.OrdinalIgnoreCase))
@@ -190,11 +194,18 @@ internal sealed class FakeCertificateClient(string name) : CertificateClient
             : Task.FromResult<CertificateOperation>(new FakeCertificateOperation(this, Pending));
     }
 
-    internal Task DeletePendingOperationAsync(FakePendingOperation pendingOperation)
+    // DELETE certificates/{name}/pending carries no version or ETag, so Key Vault removes whatever pending operation exists
+    // for the name, and returns 404 only when there is none
+    internal Task DeletePendingOperationAsync()
     {
-        Events.Add($"delete:{pendingOperation.Status}");
+        var beforeDelete = BeforeNextDeletePendingOperation;
 
-        if (!ReferenceEquals(Pending, pendingOperation))
+        BeforeNextDeletePendingOperation = null;
+        beforeDelete?.Invoke();
+
+        Events.Add($"delete:{Pending?.Status ?? "missing"}");
+
+        if (Pending is null)
         {
             return Task.FromException(new RequestFailedException(404, "Pending certificate not found."));
         }
@@ -223,7 +234,7 @@ internal sealed class FakeCertificateOperation(FakeCertificateClient certificate
         target: null,
         error: null);
 
-    public override Task DeleteAsync(CancellationToken cancellationToken = default) => certificateClient.DeletePendingOperationAsync(pendingOperation);
+    public override Task DeleteAsync(CancellationToken cancellationToken = default) => certificateClient.DeletePendingOperationAsync();
 
     public override ValueTask<Response<KeyVaultCertificateWithPolicy>> WaitForCompletionAsync(CancellationToken cancellationToken = default)
     {
