@@ -22,6 +22,7 @@ internal sealed record FakePendingOperation(
     string Status,
     byte[] Csr,
     IReadOnlyDictionary<string, string> Tags,
+    string RequestId,
     bool CancellationRequested = false);
 
 internal sealed record FakeCreateRequest(
@@ -97,7 +98,7 @@ internal sealed class FakeCertificateClient(string name) : CertificateClient
         IReadOnlyList<string>? dnsNames = null,
         IReadOnlyDictionary<string, string>? tags = null,
         bool cancellationRequested = false) =>
-        new(key, status, TestCertificates.CreateKeyVaultStyleCsr(key, dnsNames), tags ?? new Dictionary<string, string>(), cancellationRequested);
+        new(key, status, TestCertificates.CreateKeyVaultStyleCsr(key, dnsNames), tags ?? new Dictionary<string, string>(), Guid.NewGuid().ToString("N"), cancellationRequested);
 
     public AsymmetricAlgorithm GetKey(Uri keyId) => _keys[keyId];
 
@@ -228,7 +229,7 @@ internal sealed class FakeCertificateOperation(FakeCertificateClient certificate
         certificateTransparency: null,
         csr: pendingOperation.Csr,
         cancellationRequested: pendingOperation.CancellationRequested,
-        requestId: "request-id",
+        requestId: pendingOperation.RequestId,
         status: pendingOperation.Status,
         statusDetails: null,
         target: null,

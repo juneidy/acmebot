@@ -413,6 +413,72 @@ public sealed class AcmeOrderActivitiesTests
         Assert.Same(forbidden, exception.InnerException);
     }
 
+    [Fact]
+    public async Task CreateCsrWithoutBasicConstraintsAsync_ReturnsRequestIdOfTheOperationItSignedFor()
+    {
+        using var key = RSA.Create(2048);
+        var certificateClient = new FakeCertificateClient(TestCertificateName);
+        certificateClient.Current = certificateClient.CreateVersion(key);
+        var replaced = FakeCertificateClient.CreatePendingOperation(key, "inProgress");
+        certificateClient.Pending = replaced;
+
+        var (_, pendingOperationRequestId) = await CreateCsrAndPendingOperationRequestIdAsync(certificateClient, CreatePolicyItem(), new SignerRecorder(certificateClient));
+
+        Assert.Equal(Assert.IsType<FakePendingOperation>(certificateClient.Pending).RequestId, pendingOperationRequestId);
+        Assert.NotEqual(replaced.RequestId, pendingOperationRequestId);
+    }
+
+    [Fact]
+    public async Task EnsurePendingOperationIsCurrentAsync_WhenAnotherIssuanceReplacedTheOperation_Throws()
+    {
+        using var key = RSA.Create(2048);
+        var certificateClient = new FakeCertificateClient(TestCertificateName);
+        certificateClient.Current = certificateClient.CreateVersion(key);
+
+        // Issuance A finalizes its order, then issuance B for the same certificate replaces A's pending operation with its own
+        var (_, requestIdA) = await CreateCsrAndPendingOperationRequestIdAsync(certificateClient, CreatePolicyItem("example.com"), new SignerRecorder(certificateClient));
+        var policyItemB = CreatePolicyItem("example.com", "www.example.com");
+        var (_, requestIdB) = await CreateCsrAndPendingOperationRequestIdAsync(certificateClient, policyItemB, new SignerRecorder(certificateClient));
+
+        Assert.NotNull(requestIdA);
+        Assert.NotNull(requestIdB);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => AcmeOrderActivities.EnsurePendingOperationIsCurrentAsync(certificateClient, TestCertificateName, requestIdA, TestContext.Current.CancellationToken));
+
+        Assert.Contains("was not merged", exception.Message);
+
+        await AcmeOrderActivities.EnsurePendingOperationIsCurrentAsync(certificateClient, TestCertificateName, requestIdB, TestContext.Current.CancellationToken);
+
+        var pending = Assert.IsType<FakePendingOperation>(certificateClient.Pending);
+        Assert.Equal("inProgress", pending.Status);
+        Assert.Equal(requestIdB, pending.RequestId);
+        Assert.Equal(policyItemB.DnsNames, certificateClient.Creates[^1].DnsNames);
+    }
+
+    [Fact]
+    public async Task EnsurePendingOperationIsCurrentAsync_WhenNoOperationIsPending_Throws()
+    {
+        var certificateClient = new FakeCertificateClient(TestCertificateName);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => AcmeOrderActivities.EnsurePendingOperationIsCurrentAsync(certificateClient, TestCertificateName, "request-id", TestContext.Current.CancellationToken));
+
+        Assert.Equal(["get-pending"], certificateClient.Events);
+    }
+
+    [Fact]
+    public async Task EnsurePendingOperationIsCurrentAsync_WithItsOwnOperation_Passes()
+    {
+        using var key = RSA.Create(2048);
+        var certificateClient = new FakeCertificateClient(TestCertificateName);
+        var pending = FakeCertificateClient.CreatePendingOperation(key, "inProgress");
+        certificateClient.Pending = pending;
+
+        await AcmeOrderActivities.EnsurePendingOperationIsCurrentAsync(certificateClient, TestCertificateName, pending.RequestId, TestContext.Current.CancellationToken);
+
+        Assert.Equal(["get-pending"], certificateClient.Events);
+        Assert.Same(pending, certificateClient.Pending);
+    }
+
     private const string TestCertificateName = "example-com";
 
     private static readonly Uri s_acmeEndpoint = new("https://acme.example.com/directory");
@@ -426,7 +492,10 @@ public sealed class AcmeOrderActivitiesTests
         KeySize = 2048
     };
 
-    private static Task<byte[]> CreateCsrWithoutBasicConstraintsAsync(FakeCertificateClient certificateClient, CertificatePolicyItem policyItem, SignerRecorder signers) =>
+    private static async Task<byte[]> CreateCsrWithoutBasicConstraintsAsync(FakeCertificateClient certificateClient, CertificatePolicyItem policyItem, SignerRecorder signers) =>
+        (await CreateCsrAndPendingOperationRequestIdAsync(certificateClient, policyItem, signers)).Csr;
+
+    private static Task<(byte[] Csr, string? PendingOperationRequestId)> CreateCsrAndPendingOperationRequestIdAsync(FakeCertificateClient certificateClient, CertificatePolicyItem policyItem, SignerRecorder signers) =>
         AcmeOrderActivities.CreateCsrWithoutBasicConstraintsAsync(certificateClient, signers.Create, policyItem, s_acmeEndpoint, NullLogger.Instance, TestContext.Current.CancellationToken);
 
     private static void AssertRebuiltCsr(byte[] csr, AsymmetricAlgorithm expectedKey, IReadOnlyList<string> expectedDnsNames)

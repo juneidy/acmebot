@@ -102,9 +102,9 @@ public partial class AcmeOrderActivities(
     {
         var (certificatePolicyItem, orderDetails) = input;
 
-        var csr = _options.ExcludeCsrBasicConstraints
+        var (csr, pendingOperationRequestId) = _options.ExcludeCsrBasicConstraints
             ? await CreateCsrWithoutBasicConstraintsAsync(certificateClient, keyId => new CryptographyClient(keyId, credential), certificatePolicyItem, _options.Endpoint, logger)
-            : await CreateKeyVaultCsrAsync(certificatePolicyItem);
+            : (await CreateKeyVaultCsrAsync(certificatePolicyItem), null);
 
         var acmeContext = await acmeClientFactory.CreateClientAsync();
 
@@ -113,7 +113,8 @@ public partial class AcmeOrderActivities(
                 acmeContext.Account,
                 orderDetails.Payload.Finalize ?? throw new InvalidOperationException("The ACME order did not include a finalize URL."),
                 csr),
-            orderDetails.OrderUrl);
+            orderDetails.OrderUrl,
+            pendingOperationRequestId);
     }
 
     [Function(nameof(CheckIsValid))]
@@ -121,7 +122,7 @@ public partial class AcmeOrderActivities(
     {
         var acmeContext = await acmeClientFactory.CreateClientAsync();
 
-        orderDetails = OrderDetails.FromResult(await acmeContext.Client.GetOrderAsync(acmeContext.Account, orderDetails.OrderUrl), orderDetails.OrderUrl);
+        orderDetails = OrderDetails.FromResult(await acmeContext.Client.GetOrderAsync(acmeContext.Account, orderDetails.OrderUrl), orderDetails.OrderUrl, orderDetails.PendingOperationRequestId);
 
         if (orderDetails.Payload.Status == AcmeOrderStatuses.Invalid)
         {
@@ -144,6 +145,11 @@ public partial class AcmeOrderActivities(
         var acmeContext = await acmeClientFactory.CreateClientAsync();
 
         var x509Certificates = await acmeContext.Client.GetOrderCertificateAsync(acmeContext.Account, orderDetails, _options.PreferredChain);
+
+        if (orderDetails.PendingOperationRequestId is { } pendingOperationRequestId)
+        {
+            await EnsurePendingOperationIsCurrentAsync(certificateClient, certificateName, pendingOperationRequestId);
+        }
 
         var mergeCertificateOptions = new MergeCertificateOptions(
             certificateName,
@@ -193,7 +199,7 @@ public partial class AcmeOrderActivities(
     // Key Vault always adds Basic Constraints to the CSR it generates, and the Keys API can only sign with the key of a completed
     // certificate version. So the CSR is rebuilt without the extension, signed with the current version's key, and the issued
     // certificate is merged into a new version that reuses that key.
-    internal static async Task<byte[]> CreateCsrWithoutBasicConstraintsAsync(
+    internal static async Task<(byte[] Csr, string? PendingOperationRequestId)> CreateCsrWithoutBasicConstraintsAsync(
         CertificateClient certificateClient,
         Func<Uri, CryptographyClient> cryptographyClientFactory,
         CertificatePolicyItem certificatePolicyItem,
@@ -212,11 +218,34 @@ public partial class AcmeOrderActivities(
 
         try
         {
-            return KeyVaultCsrSigner.RebuildWithoutBasicConstraints(certificateOperation.Properties.Csr, cryptographyClient);
+            return (KeyVaultCsrSigner.RebuildWithoutBasicConstraints(certificateOperation.Properties.Csr, cryptographyClient), certificateOperation.Properties.RequestId);
         }
         catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.Forbidden)
         {
             throw new InvalidOperationException("Key Vault denied signing the CSR. ExcludeCsrBasicConstraints requires the Acmebot identity to have the Key Vault Crypto User role (or the keys/read and keys/sign permissions) on the vault.", ex);
+        }
+    }
+
+    // Key Vault merges by certificate name into whatever operation is pending. A concurrent issuance can replace this order's operation
+    // with one that reuses the same key, so without this check an older order would pass Key Vault's key check and store its DNS names
+    // under the newer issuance's policy and tags. Key Vault has no conditional merge, so a replace between this check and the merge
+    // (one round trip) is still possible.
+    internal static async Task EnsurePendingOperationIsCurrentAsync(CertificateClient certificateClient, string certificateName, string pendingOperationRequestId, CancellationToken cancellationToken = default)
+    {
+        string? currentRequestId;
+
+        try
+        {
+            currentRequestId = (await certificateClient.GetCertificateOperationAsync(certificateName, cancellationToken)).Properties.RequestId;
+        }
+        catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.NotFound)
+        {
+            currentRequestId = null;
+        }
+
+        if (!string.Equals(currentRequestId, pendingOperationRequestId, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Another issuance of this certificate replaced or completed the Key Vault pending operation this order was finalized with, so the issued certificate was not merged. Retry the issuance if the other one did not complete.");
         }
     }
 
@@ -283,7 +312,8 @@ public partial class AcmeOrderActivities(
         catch (Azure.RequestFailedException ex) when (ex.Status == (int)HttpStatusCode.Conflict)
         {
             // Never reuse the conflicting operation: it can hold another key, or older DNS names and tags, or have finished in the
-            // meantime. The key is reused either way, so starting over costs nothing.
+            // meantime. The key is reused either way, so starting over costs nothing. If another issuance still owns the replaced
+            // operation, it fails before merging (see EnsurePendingOperationIsCurrentAsync).
             if (!await DeletePendingCertificateOperationAsync(certificateClient, certificateName, cancellationToken))
             {
                 // The conflict is not caused by a pending operation, for example a soft-deleted certificate
