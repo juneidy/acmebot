@@ -127,9 +127,10 @@ public class CertificateActivities(
             };
         }
 
-        // A key holder means an issuance with ExcludeCsrBasicConstraints did not finish. Retry it instead of scheduling it like
-        // a fresh certificate, which would leave the self-signed version in place until it nears expiry.
-        if (certificate.IsSelfSignedKeyHolder())
+        // A key holder (marked in its Acmebot tag when it was created) means an issuance with ExcludeCsrBasicConstraints did not
+        // finish. Retry it instead of scheduling it like a fresh certificate, which would leave the self-signed version in place
+        // until it nears expiry.
+        if (properties.IsKeyHolder())
         {
             if (properties.CreatedOn is { } createdOn && createdOn + s_keyHolderGracePeriod > now)
             {

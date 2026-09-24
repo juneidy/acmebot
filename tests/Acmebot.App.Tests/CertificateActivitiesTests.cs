@@ -95,6 +95,19 @@ public sealed class CertificateActivitiesTests
         Assert.False(evaluation.IsActive);
     }
 
+    [Fact]
+    public void EvaluateCertificateState_WithSelfIssuedCertificateWithoutMarker_DefersToRenewalSchedule()
+    {
+        // Subject equals issuer and there is no certificate ID, but acmebot did not mark it as a key holder
+        using var key = RSA.Create(2048);
+        var now = DateTimeOffset.UtcNow;
+        var certificateClient = new FakeCertificateClient("example-com");
+        var version = certificateClient.CreateVersion(key, now.AddDays(-2), now.AddDays(28), CreateTags(withCertificateId: false));
+        var certificate = certificateClient.ToKeyVaultCertificate(version with { CreatedOn = now.AddDays(-2) });
+
+        Assert.Null(CertificateActivities.EvaluateCertificateState(certificate, s_endpoint, now));
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -123,7 +136,7 @@ public sealed class CertificateActivitiesTests
     {
         using var key = RSA.Create(2048);
         var certificateClient = new FakeCertificateClient("example-com");
-        var version = certificateClient.CreateVersion(key, createdOn.AddMinutes(-5), expiresOn, CreateTags(withCertificateId: false));
+        var version = certificateClient.CreateVersion(key, createdOn.AddMinutes(-5), expiresOn, CreateTags(withCertificateId: false, keyHolder: true));
 
         return certificateClient.ToKeyVaultCertificate(version with { CreatedOn = createdOn, Enabled = enabled });
     }
@@ -138,7 +151,7 @@ public sealed class CertificateActivitiesTests
         return certificateClient.ToKeyVaultCertificate(version with { CreatedOn = notBefore });
     }
 
-    private static Dictionary<string, string> CreateTags(bool withCertificateId)
+    private static Dictionary<string, string> CreateTags(bool withCertificateId, bool keyHolder = false)
     {
         var policyItem = new CertificatePolicyItem
         {
@@ -154,6 +167,11 @@ public sealed class CertificateActivitiesTests
         if (withCertificateId)
         {
             tags.SetCertificateId("aki.serial");
+        }
+
+        if (keyHolder)
+        {
+            tags.SetKeyHolder();
         }
 
         return new Dictionary<string, string>(tags);

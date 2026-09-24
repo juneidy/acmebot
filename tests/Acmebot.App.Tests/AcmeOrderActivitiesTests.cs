@@ -163,11 +163,17 @@ public sealed class AcmeOrderActivitiesTests
 
         Assert.Equal(["get-certificate", "get-pending", "create:Self", "create:Unknown"], certificateClient.Events);
 
+        var expectedHolderTags = policyItem.ToCertificateTags(s_acmeEndpoint);
+        expectedHolderTags.SetKeyHolder();
+
         var holder = certificateClient.Creates[0];
         Assert.False(holder.ReuseKey);
         Assert.Equal(1, holder.ValidityInMonths);
-        AssertTags(policyItem.ToCertificateTags(s_acmeEndpoint), holder.Tags);
+        AssertTags(expectedHolderTags, holder.Tags);
+
+        // The version that receives the issued certificate must not carry the marker
         Assert.True(certificateClient.Creates[1].ReuseKey);
+        AssertTags(policyItem.ToCertificateTags(s_acmeEndpoint), certificateClient.Creates[1].Tags);
 
         var current = Assert.IsType<FakeCertificateVersion>(certificateClient.Current);
         Assert.Equal(current.KeyId, Assert.Single(signers.KeyIds));

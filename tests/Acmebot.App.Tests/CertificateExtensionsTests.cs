@@ -150,51 +150,63 @@ public sealed class CertificateExtensionsTests
     }
 
     [Fact]
-    public void IsSelfSignedKeyHolder_WithSelfSignedManagedVersionWithoutCertificateId_ReturnsTrue()
+    public void IsKeyHolder_WithKeyHolderMarker_ReturnsTrue()
     {
-        Assert.True(CreateKeyVaultCertificate(selfSigned: true, ("Acmebot", """{"endpoint":"acme-v02.api.letsencrypt.org"}""")).IsSelfSignedKeyHolder());
+        var properties = CreateCertificateProperties(("Acmebot", """{"endpoint":"acme-v02.api.letsencrypt.org","keyHolder":true}"""));
+
+        Assert.True(properties.IsKeyHolder());
     }
 
     [Fact]
-    public void IsSelfSignedKeyHolder_WithCertificateId_ReturnsFalse()
+    public void IsKeyHolder_WithSelfIssuedCertificateWithoutMarker_ReturnsFalse()
     {
-        Assert.False(CreateKeyVaultCertificate(selfSigned: true, ("Acmebot", """{"endpoint":"acme-v02.api.letsencrypt.org","certificateId":"aki.serial"}""")).IsSelfSignedKeyHolder());
-    }
-
-    [Fact]
-    public void IsSelfSignedKeyHolder_WithIssuedCertificate_ReturnsFalse()
-    {
-        Assert.False(CreateKeyVaultCertificate(selfSigned: false, ("Acmebot", """{"endpoint":"acme-v02.api.letsencrypt.org"}""")).IsSelfSignedKeyHolder());
-    }
-
-    [Fact]
-    public void IsSelfSignedKeyHolder_WithoutAcmebotTag_ReturnsFalse()
-    {
-        Assert.False(CreateKeyVaultCertificate(selfSigned: true).IsSelfSignedKeyHolder());
-    }
-
-    [Fact]
-    public void IsSelfSignedKeyHolder_WithoutCer_ReturnsFalse()
-    {
-        using var key = RSA.Create(2048);
-        var certificateClient = new FakeCertificateClient("example-com");
-        var tags = new Dictionary<string, string> { ["Acmebot"] = """{"endpoint":"acme-v02.api.letsencrypt.org"}""" };
-        var version = certificateClient.CreateVersion(key, tags: tags) with { Cer = null };
-
-        Assert.False(certificateClient.ToKeyVaultCertificate(version).IsSelfSignedKeyHolder());
-    }
-
-    private static KeyVaultCertificate CreateKeyVaultCertificate(bool selfSigned, params (string Key, string Value)[] tags)
-    {
+        // A managed certificate without a certificate ID whose subject equals its issuer, for example a legacy one from a custom CA
         using var key = RSA.Create(2048);
         var now = DateTimeOffset.UtcNow;
         var certificateClient = new FakeCertificateClient("example-com");
-        var cer = selfSigned
-            ? TestCertificates.CreateSelfSignedCertificate(key, now.AddDays(-1), now.AddDays(30))
-            : TestCertificates.CreateIssuedCertificate(key, now.AddDays(-1), now.AddDays(30));
-        var version = certificateClient.CreateVersion(key, tags: tags.ToDictionary(x => x.Key, x => x.Value), cer: cer);
+        var tags = new Dictionary<string, string> { ["Acmebot"] = """{"endpoint":"acme-v02.api.letsencrypt.org"}""" };
+        var cer = TestCertificates.CreateSelfSignedCertificate(key, now.AddDays(-1), now.AddDays(30));
+        var certificate = certificateClient.ToKeyVaultCertificate(certificateClient.CreateVersion(key, tags: tags, cer: cer));
 
-        return certificateClient.ToKeyVaultCertificate(version);
+        Assert.False(certificate.Properties.IsKeyHolder());
+    }
+
+    [Fact]
+    public void IsKeyHolder_WithoutAcmebotTag_ReturnsFalse()
+    {
+        Assert.False(CreateCertificateProperties().IsKeyHolder());
+    }
+
+    [Fact]
+    public void IsKeyHolder_WithLegacyTags_ReturnsFalse()
+    {
+        var properties = CreateCertificateProperties(("Issuer", "Acmebot"), ("Endpoint", "https://acme-v02.api.letsencrypt.org/directory"));
+
+        Assert.False(properties.IsKeyHolder());
+    }
+
+    [Fact]
+    public void SetKeyHolder_PreservesExistingMetadata()
+    {
+        var tags = CreatePolicy(profile: "tlsserver").ToCertificateTags(s_endpoint);
+
+        tags.SetKeyHolder();
+
+        using var metadata = JsonDocument.Parse(tags["Acmebot"]);
+        Assert.Equal("acme-v02.api.letsencrypt.org", metadata.RootElement.GetProperty("endpoint").GetString());
+        Assert.Equal("Azure DNS", metadata.RootElement.GetProperty("dnsProvider").GetString());
+        Assert.Equal("tlsserver", metadata.RootElement.GetProperty("profile").GetString());
+        Assert.True(metadata.RootElement.GetProperty("keyHolder").GetBoolean());
+        Assert.True(CreateCertificateProperties(("Acmebot", tags["Acmebot"])).IsKeyHolder());
+    }
+
+    [Fact]
+    public void ToCertificateTags_DoesNotMarkKeyHolder()
+    {
+        var tags = CreatePolicy(profile: null).ToCertificateTags(s_endpoint);
+
+        using var metadata = JsonDocument.Parse(tags["Acmebot"]);
+        Assert.False(metadata.RootElement.TryGetProperty("keyHolder", out _));
     }
 
     private static CertificatePolicyItem CreatePolicy(string? profile)

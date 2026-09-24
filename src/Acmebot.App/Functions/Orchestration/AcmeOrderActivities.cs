@@ -282,16 +282,21 @@ public partial class AcmeOrderActivities(
         // An in-progress pending operation blocks creating a new version
         await DeletePendingCertificateOperationAsync(certificateClient, certificatePolicyItem.CertificateName, cancellationToken);
 
-        // The self-signed version only holds the new key until the issued certificate is merged. If issuance fails after this
-        // point, renewal evaluation recognises it as a key holder and retries it (see CertificateActivities.EvaluateCertificateState).
+        // The self-signed version only holds the new key until the issued certificate is merged. It is marked as a key holder in
+        // its Acmebot tag, so if issuance fails after this point, renewal evaluation retries it (see
+        // CertificateActivities.EvaluateCertificateState). The version that receives the issued certificate is not marked.
         var certificatePolicy = certificatePolicyItem.ToCertificatePolicy(issuerName: WellKnownIssuerNames.Self, reuseKey: false);
 
         certificatePolicy.ValidityInMonths = 1;
 
+        var tags = certificatePolicyItem.ToCertificateTags(endpoint);
+
+        tags.SetKeyHolder();
+
         var certificateOperation = await certificateClient.StartCreateCertificateAsync(
             certificatePolicyItem.CertificateName,
             certificatePolicy,
-            tags: certificatePolicyItem.ToCertificateTags(endpoint),
+            tags: tags,
             cancellationToken: cancellationToken);
 
         return (await certificateOperation.WaitForCompletionAsync(cancellationToken)).Value;
