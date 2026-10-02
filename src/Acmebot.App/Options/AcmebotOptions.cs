@@ -13,6 +13,9 @@ public class AcmebotOptions
 
     public bool RequireAppRoles { get; set; } = false;
 
+    // DEV ONLY: treats every HTTP request as an authenticated user. Never enable on a reachable production app.
+    public bool DisableAuthentication { get; set; } = false;
+
     public bool UseSystemNameServer { get; set; } = false;
 
     [Required]

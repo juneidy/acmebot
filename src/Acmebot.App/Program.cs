@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Security.Claims;
+using System.Text.Json;
 
 using Acmebot.App.Acme;
 using Acmebot.App.Extensions;
@@ -17,6 +18,7 @@ using Azure.Storage.Blobs;
 
 using DnsClient;
 
+using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Builder;
 using Microsoft.Azure.Functions.Worker.OpenTelemetry;
 using Microsoft.Extensions.Configuration;
@@ -31,6 +33,27 @@ var builder = FunctionsApplication.CreateBuilder(args);
 
 builder.ConfigureFunctionsWebApplication()
        .AddHttpApi();
+
+// DEV ONLY: replaces the anonymous App Service principal so the dashboard and API work without Easy Auth.
+if (builder.Configuration.GetValue<bool>("Acmebot:DisableAuthentication"))
+{
+    builder.UseMiddleware(async (context, next) =>
+    {
+        var httpContext = context.GetHttpContext();
+
+        if (httpContext is not null)
+        {
+            httpContext.User = new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim(ClaimTypes.Name, "dev-auth-bypass"),
+                new Claim("roles", "Acmebot.IssueCertificate"),
+                new Claim("roles", "Acmebot.RevokeCertificate")
+            ], authenticationType: "DevAuthBypass"));
+        }
+
+        await next();
+    });
+}
 
 builder.Services.AddOpenTelemetry()
        .WithMetrics(metrics => metrics.AddHttpClientInstrumentation())
